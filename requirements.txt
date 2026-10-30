@@ -1,0 +1,7 @@
+# Also needs ffmpeg (with libass) on PATH: https://ffmpeg.org/download.html
+yt-dlp>=2024.10.0
+faster-whisper>=1.0.0
+av>=11,<19    # PyAV 19 removed an option faster-whisper uses
+anthropic>=0.40.0
+opencv-python>=4.8
+numpy>=1.24

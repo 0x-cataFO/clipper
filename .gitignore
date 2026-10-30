@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Output and media (clips, downloads, transcripts)
+clips/
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.m4a
+*.wav
+
+# Secrets
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
