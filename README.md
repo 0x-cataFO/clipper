@@ -1,7 +1,7 @@
 # clipper
 
-Turn a long YouTube video, podcast or livestream into short vertical clips for TikTok, YouTube Shorts and Reels.
-Each clip is reframed to 9:16 around the speaker, has its dead air cut out, and has word-by-word captions burned in.
+Turn a long YouTube video, podcast or livestream into short clips for TikTok, YouTube Shorts, Reels and feed posts.
+Each clip is reframed around the speaker (vertical 9:16 by default, or 4:5, 1:1, 16:9 or any custom size), has its dead air cut out, and has word-by-word captions burned in.
 
 ```
 python clipper.py "https://www.youtube.com/watch?v=VIDEO_ID" -n 5
@@ -26,6 +26,7 @@ clips/VIDEO_ID/
 - [Usage](#usage)
 - [All options](#all-options)
 - [Output files](#output-files)
+- [Choosing the output size](#choosing-the-output-size)
 - [Customising clip selection](#customising-clip-selection)
 - [Customising captions](#customising-captions)
 - [Troubleshooting](#troubleshooting)
@@ -43,7 +44,7 @@ clips/VIDEO_ID/
 | 2. Transcribe | Speech-to-text with a timestamp for every word. Runs locally, no API needed. | faster-whisper |
 | 3. Pick highlights | Claude reads the transcript and picks self-contained moments with a strong hook and a payoff. Optional: you can give the times yourself. | Anthropic API |
 | 4. Cut and tighten | Cuts each clip and removes pauses longer than 0.35s. | ffmpeg |
-| 5. Reframe to 9:16 | Finds the speaker's face and keeps it centred, with smooth pans and hard jumps on scene cuts. | OpenCV (YuNet) |
+| 5. Reframe | Crops to 9:16 (or the shape you choose), keeping the speaker's face centred with smooth pans and hard jumps on scene cuts. | OpenCV (YuNet) |
 | 6. Captions | Short 1–3 word captions with the spoken word highlighted, burned into the video. | libass |
 
 Every expensive step is cached. Re-running the same video reuses the download, the transcript and the picks, so tweaking captions or clip times takes seconds instead of minutes.
@@ -197,10 +198,12 @@ The transcript is cached in `transcript.json`. Delete it if you change `--whispe
 | `--language` | auto | Force the transcript language, e.g. `en` |
 | `--no-tighten` | off | Keep pauses instead of cutting them |
 | `--max-pause` | `0.35` | Pauses longer than this many seconds are cut |
+| `--format` | `9:16` | Output shape: `9:16` (1080×1920), `4:5` (1080×1350), `1:1` (1080×1080) or `16:9` (1920×1080) |
+| `--size` | — | Exact output size as `WIDTHxHEIGHT`, e.g. `720x1280`. Overrides `--format`. |
 | `--no-captions` | off | Don't burn in captions |
 | `--font` | `Montserrat` | Caption font family name |
 | `--fonts-dir` | — | Folder of `.ttf`/`.otf` files to use for captions |
-| `--font-size` | `84` | Caption size on the 1080×1920 frame |
+| `--font-size` | scaled | Caption size in pixels. By default 84 on a 1080-wide frame, scaled to the output size. |
 | `--highlight` | `FFE500` | Colour of the word being spoken, as hex RGB |
 | `--uppercase` | off | ALL-CAPS captions |
 | `--keep-temp` | off | Keep intermediate files (cut clips, `.ass` subtitle files) in `tmp/` |
@@ -213,8 +216,9 @@ Everything for one video goes in `clips/<video-id>/` (or `clips/<file-name>/` fo
 
 | File | What it is |
 |---|---|
-| `clip_01.mp4`, `clip_02.mp4`, … | Finished clips, 1080×1920, ranked best first when Claude picked them |
-| `clips.json` | For each clip: file, title, hook, score, Claude's reason, source start/end and final length |
+| `clip_01.mp4`, `clip_02.mp4`, … | Finished 9:16 clips (1080×1920), ranked best first when Claude picked them |
+| `clip_01_1080x1080.mp4`, … | Clips in any other size. The size is added to the name so formats don't overwrite each other. |
+| `clips.json` | For each clip: file, title, hook, score, Claude's reason, source start/end, final length and size. Other sizes get their own file, e.g. `clips_1080x1080.json`. |
 | `source.mp4` | The downloaded video (YouTube only). Reused on re-runs. |
 | `transcript.json` | Word-level transcript. Reused on re-runs. |
 | `highlights.json` | Claude's validated picks. Reused unless you pass `--repick`. |
@@ -230,9 +234,33 @@ Example `clips.json` entry:
   "why": "Personal story with a clear payoff",
   "source_start": 0.65,
   "source_end": 35.02,
-  "length_sec": 30.66
+  "length_sec": 30.66,
+  "width": 1080,
+  "height": 1920
 }
 ```
+
+## Choosing the output size
+
+Clips are vertical 9:16 by default. Pick another shape with `--format`, or any exact size with `--size`:
+
+| Option | Size | Good for |
+|---|---|---|
+| `--format 9:16` (default) | 1080×1920 | TikTok, YouTube Shorts, Reels, Stories |
+| `--format 4:5` | 1080×1350 | Instagram and Facebook feed posts |
+| `--format 1:1` | 1080×1080 | Square posts, LinkedIn, X |
+| `--format 16:9` | 1920×1080 | Regular YouTube, keeping the full original frame |
+| `--size 720x1280` | anything | Smaller files or a platform's exact spec. Width and height must be even, 128–4096. |
+
+```bash
+python clipper.py VIDEO --format 1:1
+python clipper.py VIDEO --format 16:9 --clips 2:15-3:30
+python clipper.py VIDEO --size 720x1280
+```
+
+- The crop is always the largest window of that shape that fits the source, and it follows the speaker's face. If the window already spans the full width (for example 16:9 from a 16:9 video), there is nothing to pan, so the whole frame is used.
+- Captions scale with the frame and sit lower on wider shapes (about 29% up on 9:16, 8% up on 16:9) to stay clear of faces. `--font-size` overrides the scaled size.
+- You can make several shapes from one video: run the command again with a different `--format`. The download, transcript and picks are reused, and each size gets its own file names.
 
 ## Customising clip selection
 
@@ -250,7 +278,7 @@ python clipper.py VIDEO -n 6 --hook-rules examples/hook_rules.md
 
 ## Customising captions
 
-Captions show 1–3 words at a time (at most about 18 characters), positioned in the lower third with a thick outline and shadow. The word being spoken is highlighted.
+Captions show 1–3 words at a time (at most about 18 characters), positioned low in the frame with a thick outline and shadow. Size and position scale with the output shape (see [Choosing the output size](#choosing-the-output-size)). The word being spoken is highlighted.
 
 ```bash
 # Yellow-highlighted, all caps, bigger
@@ -323,7 +351,7 @@ pip install pytest
 pytest -v
 ```
 
-They check clip validation, pause removal, caption timing, the frame-accurate cutting (frame counts and audio/video lengths) and that each finished clip is 1080×1920 H.264/AAC. They also run automatically on GitHub Actions for every push (`.github/workflows/tests.yml`).
+They check clip validation, pause removal, caption timing, the frame-accurate cutting (frame counts and audio/video lengths) that each finished clip is H.264/AAC at the requested size for every format, and that the crop follows the speaker in non-vertical shapes. They also run automatically on GitHub Actions for every push (`.github/workflows/tests.yml`).
 
 ## Responsible use
 

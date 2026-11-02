@@ -7,7 +7,7 @@ Pipeline
   2. Transcribe      faster-whisper with word-level timestamps (cached)
   3. Pick highlights Claude reads the transcript and returns the best segments (cached)
   4. Cut + tighten   ffmpeg cuts each segment and removes long pauses
-  5. Reframe 9:16    OpenCV tracks the speaker's face and crops around it
+  5. Reframe         OpenCV tracks the speaker's face and crops to 9:16, 4:5, 1:1 or 16:9
   6. Captions        word-by-word highlighted captions burned in (ASS / libass)
 
 Requirements
@@ -22,9 +22,12 @@ Usage
   python clipper.py podcast.mp4 --clips 12:05-13:20,41:00-42:10   # manual ranges, no API call
   python clipper.py URL --repick          # re-run highlight selection, reuse download + transcript
   python clipper.py URL --hook-rules my_hooks.md --uppercase --fonts-dir ./fonts
+  python clipper.py URL --format 1:1          # 9:16 (default), 4:5, 1:1 or 16:9
+  python clipper.py URL --size 720x1280       # any exact size
 
 Output (in ./clips/<video-id>/)
   clip_01.mp4 ...   1080x1920 H.264/AAC, ranked best first
+                    (other sizes are named clip_01_1080x1080.mp4 etc., so formats don't clash)
   clips.json        title, hook, score and source timestamps for each clip
   transcript.json   cached transcript      highlights.json   cached picks
   (delete transcript.json to re-transcribe, e.g. after changing --whisper-model)
@@ -52,7 +55,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-OUT_W, OUT_H = 1080, 1920
+FORMATS = {                     # --format name -> output size (width, height)
+    "9:16": (1080, 1920),       # TikTok, Shorts, Reels
+    "4:5": (1080, 1350),        # Instagram / Facebook feed
+    "1:1": (1080, 1080),        # square posts
+    "16:9": (1920, 1080),       # regular YouTube / landscape
+}
+DEFAULT_FORMAT = "9:16"
 DEFAULT_CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 YUNET_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
              "face_detection_yunet/face_detection_yunet_2023mar.onnx")
@@ -141,6 +150,19 @@ def parse_time(s: str) -> float:
     for part in s.strip().split(":"):
         total = total * 60 + float(part)
     return total
+
+
+def parse_size(s: str) -> tuple[int, int]:
+    """'720x1280' -> (720, 1280). Sizes must be even (H.264 needs it) and sensible."""
+    m = re.fullmatch(r"\s*(\d+)\s*[xX×]\s*(\d+)\s*", s or "")
+    if not m:
+        die(f"bad --size '{s}'. Use WIDTHxHEIGHT, e.g. 720x1280")
+    w, h = int(m.group(1)), int(m.group(2))
+    if not (128 <= w <= 4096 and 128 <= h <= 4096):
+        die(f"--size {w}x{h} is out of range; width and height must be 128-4096")
+    if w % 2 or h % 2:
+        die(f"--size {w}x{h}: width and height must be even numbers")
+    return w, h
 
 
 def fmt_ts(t: float) -> str:
@@ -591,8 +613,16 @@ def plan_camera(sample_frames: list[int], sample_cx: list[float], nframes: int,
     return np.clip(center - crop_w / 2, 0, src_w - crop_w).round().astype(int)
 
 
-def render_vertical(cut_path: Path, ass_path: Path | None, out_path: Path,
-                    finder: FaceFinder, fonts_dir: Path | None) -> None:
+def crop_box(src_w: int, src_h: int, out_w: int, out_h: int) -> tuple[int, int]:
+    """Largest window with the output's aspect ratio that fits inside the source frame."""
+    ar = out_w / out_h
+    crop_w = max(2, min(src_w, round(src_h * ar)) // 2 * 2)
+    crop_h = max(2, min(src_h, round(crop_w / ar)) // 2 * 2)
+    return crop_w, crop_h
+
+
+def render_clip(cut_path: Path, ass_path: Path | None, out_path: Path,
+                finder: FaceFinder, fonts_dir: Path | None, out_w: int, out_h: int) -> None:
     info = probe(cut_path)
     fps = info["fps"]
     cap = cv2.VideoCapture(str(cut_path))
@@ -600,12 +630,14 @@ def render_vertical(cut_path: Path, ass_path: Path | None, out_path: Path,
         die(f"OpenCV could not open {cut_path}")
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    crop_w, crop_h = crop_box(src_w, src_h, out_w, out_h)
+    track = crop_w < src_w          # nothing to pan when the crop spans the full width
 
-    # Pass 1: sample faces ~5 times a second.
+    # Pass 1: count frames and, if the crop can move, sample faces ~5 times a second.
     step = max(1, round(float(fps) / 5))
     sample_frames, sample_cx, prev, n = [], [], None, 0
     while True:
-        if n % step == 0:
+        if track and n % step == 0:
             ok, frame = cap.read()
             if not ok:
                 break
@@ -628,19 +660,16 @@ def render_vertical(cut_path: Path, ass_path: Path | None, out_path: Path,
     if nframes == 0:
         die(f"no frames decoded from {cut_path}")
 
-    # Crop box: tallest 9:16 window that fits the source.
-    crop_w = min(src_w, round(src_h * 9 / 16)) // 2 * 2
-    crop_h = min(src_h, round(crop_w * 16 / 9)) // 2 * 2
     y0 = (src_h - crop_h) // 2
     xs = plan_camera(sample_frames, sample_cx, nframes, src_w, crop_w, float(fps) / step)
-    interp = cv2.INTER_AREA if crop_w > OUT_W else cv2.INTER_CUBIC
+    interp = cv2.INTER_AREA if crop_w > out_w else cv2.INTER_CUBIC
 
     # Pass 2: crop every frame and stream it to ffmpeg, which adds audio + captions.
     vf = []
     if ass_path is not None:
         vf = ["-vf", f"ass={ass_path.name}" + (f":fontsdir={fonts_dir.name}" if fonts_dir else "")]
     cmd = ["ffmpeg", "-y", "-v", "error",
-           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{OUT_W}x{OUT_H}", "-r", fps_str(fps), "-i", "-",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{out_w}x{out_h}", "-r", fps_str(fps), "-i", "-",
            "-i", cut_path.name, "-map", "0:v:0", "-map", "1:a:0", *vf,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
            "-c:a", "copy", "-movflags", "+faststart", out_path.name]
@@ -656,7 +685,7 @@ def render_vertical(cut_path: Path, ass_path: Path | None, out_path: Path,
                     break
                 x0 = int(xs[f])
                 crop = frame[y0:y0 + crop_h, x0:x0 + crop_w]
-                proc.stdin.write(cv2.resize(crop, (OUT_W, OUT_H), interpolation=interp).tobytes())
+                proc.stdin.write(cv2.resize(crop, (out_w, out_h), interpolation=interp).tobytes())
                 f += 1
             proc.stdin.close()
         except BrokenPipeError:
@@ -692,19 +721,45 @@ def clean_word(t: str, upper: bool) -> str:
     return t.upper() if upper else t
 
 
-def write_ass(words: list[dict], path: Path, font: str, size: int, highlight: str,
-              upper: bool, max_words: int = 3, max_chars: int = 18) -> None:
+def caption_layout(out_w: int, out_h: int, size: int | None = None) -> dict:
+    """Caption style scaled to the output frame. The 9:16 1080x1920 look (84px text,
+    sitting in the lower third) is the reference; other shapes keep the same proportions,
+    and wider frames put captions lower so they stay clear of the speaker's face."""
+    scale = min(out_w, out_h) / 1080
+    ratio = out_h / out_w
+    if ratio >= 1.5:        # tall: 9:16
+        lift = 0.2917
+    elif ratio >= 1.2:      # 4:5
+        lift = 0.16
+    elif ratio >= 0.95:     # square
+        lift = 0.12
+    else:                   # landscape: classic subtitle position
+        lift = 0.08
+    return {
+        "size": size if size else max(12, round(84 * scale)),
+        "outline": max(2, round(7 * scale)),
+        "shadow": max(1, round(3 * scale)),
+        "margin_lr": round(0.065 * out_w),
+        "margin_v": round(lift * out_h),
+        "max_chars": max(18, round(18 * out_w / (1080 * scale))),
+    }
+
+
+def write_ass(words: list[dict], path: Path, font: str, size: int | None, highlight: str,
+              upper: bool, out_w: int = 1080, out_h: int = 1920, max_words: int = 3) -> None:
     hl = ass_color(highlight)
+    lay = caption_layout(out_w, out_h, size)
+    max_chars = lay["max_chars"]
     header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: {OUT_W}
-PlayResY: {OUT_H}
+PlayResX: {out_w}
+PlayResY: {out_h}
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,560,1
+Style: Caption,{font},{lay['size']},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{lay['outline']},{lay['shadow']},2,{lay['margin_lr']},{lay['margin_lr']},{lay['margin_v']},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -745,7 +800,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # ----------------------------------------------------------------------------- main
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Turn a long video into captioned vertical clips.",
+    ap = argparse.ArgumentParser(description="Turn a long video into short captioned clips.",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("source", help="YouTube URL or local video file")
     ap.add_argument("-o", "--out", default="clips", help="output folder")
@@ -761,10 +816,14 @@ def main() -> None:
     ap.add_argument("--language", help="force transcript language, e.g. en (None = auto-detect)")
     ap.add_argument("--no-tighten", action="store_true", help="keep pauses")
     ap.add_argument("--max-pause", type=float, default=0.35, help="pauses longer than this are cut (s)")
+    ap.add_argument("--format", choices=list(FORMATS), default=DEFAULT_FORMAT,
+                    help="output shape: " + ", ".join(f"{k} = {w}x{h}" for k, (w, h) in FORMATS.items()))
+    ap.add_argument("--size", help="exact output size as WIDTHxHEIGHT, e.g. 720x1280 (overrides --format)")
     ap.add_argument("--no-captions", action="store_true", help="skip burned-in captions")
     ap.add_argument("--font", default="Montserrat", help="caption font family (falls back if missing)")
     ap.add_argument("--fonts-dir", help="folder with .ttf/.otf files to use for captions")
-    ap.add_argument("--font-size", type=int, default=84, help="caption size on the 1080x1920 frame")
+    ap.add_argument("--font-size", type=int,
+                    help="caption size in pixels (None = 84 on a 1080-wide frame, scaled to the output size)")
     ap.add_argument("--highlight", default="FFE500", help="active-word colour (hex RGB)")
     ap.add_argument("--uppercase", action="store_true", help="ALL-CAPS captions")
     ap.add_argument("--keep-temp", action="store_true", help="keep intermediate files")
@@ -774,6 +833,11 @@ def main() -> None:
         die("--num-clips must be at least 1")
     if not 0 < args.min_sec < args.max_sec:
         die("--min-sec must be positive and smaller than --max-sec")
+    if args.font_size is not None and args.font_size < 8:
+        die("--font-size must be at least 8")
+    out_w, out_h = parse_size(args.size) if args.size else FORMATS[args.format]
+    # Default 9:16 keeps the plain names; other sizes get a suffix so formats don't overwrite each other.
+    suffix = "" if (out_w, out_h) == FORMATS[DEFAULT_FORMAT] else f"_{out_w}x{out_h}"
     if args.no_captions:
         for tool in ("ffmpeg", "ffprobe"):
             if not shutil.which(tool):
@@ -831,9 +895,10 @@ def main() -> None:
                 shutil.copy2(f, fonts_dir / f.name)
 
     finder = FaceFinder()
+    log(f"      output size: {out_w}x{out_h}")
     results = []
     for i, c in enumerate(clips, 1):
-        name = f"clip_{i:02d}"
+        name = f"clip_{i:02d}{suffix}"
         log(f"[4-6/6] {name}: {fmt_ts(c['start'])}-{fmt_ts(c['end'])}"
             + (f"  \"{c['title']}\"" if c.get("title") else ""))
         segs = keep_segments(words, c["start"], c["end"], not args.no_tighten, args.max_pause)
@@ -846,19 +911,20 @@ def main() -> None:
         ass_path = None
         if not args.no_captions and timed:
             ass_path = tmp / f"{name}.ass"
-            write_ass(timed, ass_path, args.font, args.font_size, args.highlight, args.uppercase)
+            write_ass(timed, ass_path, args.font, args.font_size, args.highlight, args.uppercase,
+                      out_w, out_h)
         out_path = tmp / f"{name}.mp4"
-        render_vertical(cut_path, ass_path, out_path, finder, fonts_dir)
+        render_clip(cut_path, ass_path, out_path, finder, fonts_dir, out_w, out_h)
         final = workdir / f"{name}.mp4"
         shutil.move(str(out_path), final)
         length = probe(final)["duration"]
         results.append({"file": final.name, "title": c.get("title", ""), "hook": c.get("hook", ""),
                         "score": c.get("score", 0), "why": c.get("why", ""),
                         "source_start": c["start"], "source_end": c["end"],
-                        "length_sec": round(length, 2)})
+                        "length_sec": round(length, 2), "width": out_w, "height": out_h})
         log(f"      -> {final}  ({length:.1f}s)")
 
-    (workdir / "clips.json").write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    (workdir / f"clips{suffix}.json").write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     if not args.keep_temp:
         shutil.rmtree(tmp, ignore_errors=True)
     log(f"\nDone: {len(results)} clip(s) in {workdir.resolve()}")
